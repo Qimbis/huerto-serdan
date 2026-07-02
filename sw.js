@@ -1,5 +1,5 @@
-const CACHE_NAME = 'orchard-shell-v1';
-const SHELL_FILES = ['./', './index.html', './app.js', './icon.svg', './manifest.webmanifest'];
+const CACHE_NAME = 'orchard-shell-v2';
+const SHELL_FILES = ['./', './index.html', './app.js', './config.js', './icon.svg', './manifest.webmanifest'];
 
 self.addEventListener('install', event => {
   event.waitUntil(
@@ -25,13 +25,13 @@ self.addEventListener('fetch', event => {
   const isShellFile = url.origin === self.location.origin && SHELL_BASENAMES.includes(basename);
   if (!isShellFile) return;
 
+  // Network-first: always serve the freshest shell when online so deploys
+  // reach users immediately; fall back to the cached copy offline.
   event.respondWith(
-    caches.match(event.request).then(cached =>
-      cached || fetch(event.request).then(response => {
-        const copy = response.clone();
-        caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy));
-        return response;
-      })
-    )
+    fetch(event.request).then(response => {
+      const copy = response.clone();
+      caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy));
+      return response;
+    }).catch(() => caches.match(event.request))
   );
 });
