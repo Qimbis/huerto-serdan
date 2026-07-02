@@ -46,12 +46,13 @@ const LOG_TYPE_LABELS = {
   'Frost/Hail Damage': 'Daño por helada/granizo',
   'Tree State': 'Estado de árboles',
   'Health': 'Salud',
+  'Census': 'Censo',
   'Other': 'Otro',
 };
 const labelForLogType = t => LOG_TYPE_LABELS[t] || t;
-// 'Tree State' / 'Health' events carry tree positions, so they are created
-// from the tree grid, not the free-form history dropdown
-const LOG_TYPES = Object.keys(LOG_TYPE_LABELS).filter(t => t !== 'Tree State' && t !== 'Health');
+// 'Tree State' / 'Health' / 'Census' events carry tree positions, so they
+// are created from the tree grid or census flow, not the history dropdown
+const LOG_TYPES = Object.keys(LOG_TYPE_LABELS).filter(t => !['Tree State', 'Health', 'Census'].includes(t));
 
 // Per-tree alive-state ('Tree State' events) — data keys English, labels Spanish
 const TREE_STATE_LABELS = {
@@ -508,10 +509,43 @@ function openRowDetail(rowId) {
   });
 }
 
-async function updateRowRemote(row, patch, onSuccess, onFailure) {
+// Core write helpers (no UI side effects) — shared by the row-detail modal
+// and the census flow.
+async function updateRowCore(row, patch) {
   const { error } = await supabase.from('rows').update(patch).eq('id', row.id);
   if (error) {
     console.error('Row update failed', error);
+    return false;
+  }
+  return true;
+}
+
+async function insertRowEventCore(row, entry) {
+  const payload = {
+    row_id: row.id,
+    event_date: entry.date,
+    type: entry.type,
+    note: entry.text || '',
+    tree_positions: entry.positions || null,
+    status: entry.status || null,
+    created_by: currentUser?.id ?? null,
+  };
+  const { data, error } = await supabase.from('row_events').insert(payload).select().single();
+  if (error) {
+    console.error('Row event insert failed', error);
+    return false;
+  }
+  row.log.push({
+    date: data.event_date, type: data.type, text: data.note,
+    positions: data.tree_positions || undefined,
+    status: data.status || undefined,
+  });
+  return true;
+}
+
+async function updateRowRemote(row, patch, onSuccess, onFailure) {
+  const ok = await updateRowCore(row, patch);
+  if (!ok) {
     if (onFailure) onFailure();
     showSaveError('No se pudo guardar el cambio — revisa tu conexión e intenta de nuevo.');
     renderMap(); renderInventory(); openRowDetail(row.id);
@@ -526,26 +560,11 @@ async function updateRowRemote(row, patch, onSuccess, onFailure) {
 }
 
 async function insertRowEventRemote(row, entry) {
-  const payload = {
-    row_id: row.id,
-    event_date: entry.date,
-    type: entry.type,
-    note: entry.text || '',
-    tree_positions: entry.positions || null,
-    status: entry.status || null,
-    created_by: currentUser?.id ?? null,
-  };
-  const { data, error } = await supabase.from('row_events').insert(payload).select().single();
-  if (error) {
-    console.error('Row event insert failed', error);
+  const ok = await insertRowEventCore(row, entry);
+  if (!ok) {
     showSaveError('No se pudo guardar la entrada del historial — revisa tu conexión e intenta de nuevo.');
     return;
   }
-  row.log.push({
-    date: data.event_date, type: data.type, text: data.note,
-    positions: data.tree_positions || undefined,
-    status: data.status || undefined,
-  });
   markSaved();
   openRowDetail(row.id);
 }
@@ -645,6 +664,378 @@ function wireTreeGrid(row) {
   $$('[data-tree-health]').forEach(btn =>
     btn.addEventListener('click', () => apply('Health', btn.dataset.treeHealth)));
   $('#tree-cancel').addEventListener('click', () => { selected.clear(); syncUi(); });
+}
+
+// ---------- Census tab (Fase 3/4: censo árbol por árbol) ----------
+const CENSUS_STASH_KEY = 'orchardCensusProgress';
+
+// { rowId, pos, answers: { [pos]: {state, health, note} | null (= saltado) } }
+let censusSession = null;
+
+function saveCensusStash() {
+  try { localStorage.setItem(CENSUS_STASH_KEY, JSON.stringify(censusSession)); } catch (e) { /* full/blocked storage: stash is best-effort */ }
+}
+function clearCensusStash() {
+  censusSession = null;
+  localStorage.removeItem(CENSUS_STASH_KEY);
+}
+function loadCensusStash() {
+  try {
+    const raw = localStorage.getItem(CENSUS_STASH_KEY);
+    if (!raw) return null;
+    const s = JSON.parse(raw);
+    const row = ORCHARD_DATA.rows.find(r => r.id === s.rowId);
+    if (!row || s.pos < 1) return null;
+    return s;
+  } catch (e) {
+    return null;
+  }
+}
+
+function lastCensusDate(row) {
+  let last = null;
+  for (const e of row.log) if (e.type === 'Census') last = e.date; // log is oldest→newest
+  return last;
+}
+
+function renderCensus() {
+  const panel = $('#tab-census');
+  if (!panel) return;
+  if (censusSession) {
+    const row = ORCHARD_DATA.rows.find(r => r.id === censusSession.rowId);
+    if (!row) { clearCensusStash(); renderCensusList(); return; }
+    if (censusSession.pos > row.treeCount) renderCensusEnd(row);
+    else renderCensusTree(row);
+    return;
+  }
+  renderCensusList();
+}
+
+function renderCensusList() {
+  const panel = $('#tab-census');
+  const stash = loadCensusStash();
+
+  const resumeBanner = stash ? `
+    <div class="rounded-lg border border-amber-700 bg-amber-900/30 p-3 flex items-center justify-between gap-2">
+      <div class="text-sm">Censo de la <span class="font-semibold">Hilera ${stash.rowId}</span> sin terminar (árbol ${Math.min(stash.pos, (ORCHARD_DATA.rows.find(r => r.id === stash.rowId)?.treeCount ?? stash.pos))} pendiente)</div>
+      <div class="flex gap-1.5 shrink-0">
+        <button id="census-resume" class="tap-target rounded-md bg-amber-700 hover:bg-amber-600 text-white text-xs font-medium px-3">Continuar</button>
+        <button id="census-discard" class="tap-target rounded-md bg-slate-700 hover:bg-slate-600 text-white text-xs font-medium px-3">Descartar</button>
+      </div>
+    </div>` : '';
+
+  const sections = Object.values(SECTIONS).map(section => {
+    const rows = rowsBySection(section.id);
+    if (rows.length === 0) return '';
+    const cards = rows.map(row => {
+      const last = lastCensusDate(row);
+      const badge = last
+        ? `<span class="text-[11px] px-2 py-0.5 rounded-full border border-slate-600 text-slate-400">Censada ${esc(last)}</span>`
+        : `<span class="text-[11px] px-2 py-0.5 rounded-full border border-amber-600 text-amber-400">Nunca censada</span>`;
+      return `
+        <button data-census-row="${row.id}" class="census-row-card w-full text-left tap-target rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700/70 active:bg-slate-700 transition p-3 flex items-center justify-between gap-2">
+          <div>
+            <span class="font-semibold">Hilera ${row.id}</span>
+            <span class="text-xs text-slate-400 ml-2">${esc((VARIETIES[row.variety] || {}).label || row.variety)} · ${row.treeCount} árboles</span>
+          </div>
+          ${badge}
+        </button>`;
+    }).join('');
+    return `
+      <div>
+        <h3 class="font-semibold text-slate-200 px-1 mb-2">${esc(section.name)}</h3>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">${cards}</div>
+      </div>`;
+  }).join('');
+
+  panel.innerHTML = `
+    <div class="px-1">
+      <h2 class="font-semibold">Censo</h2>
+      <p class="text-xs text-slate-400 mt-0.5">Elige una hilera y revisa sus árboles uno por uno. Puedes salir a la mitad y continuar después.</p>
+    </div>
+    ${resumeBanner}
+    ${sections}
+    <div class="pt-1">
+      <button id="census-add-row" class="tap-target w-full rounded-lg border border-dashed border-slate-600 text-slate-400 hover:text-white hover:border-slate-400 text-sm py-2.5 flex items-center justify-center gap-1.5">
+        <i data-lucide="plus" class="w-4 h-4"></i> Agregar hilera (si falta alguna)
+      </button>
+      <div id="census-add-row-form" class="hidden mt-2 rounded-lg border border-slate-700 bg-slate-800 p-3 space-y-2">
+        <div class="grid grid-cols-2 gap-2">
+          <select id="new-row-section" class="tap-target rounded-md bg-slate-900 border border-slate-600 px-2 text-sm text-slate-100">
+            ${Object.values(SECTIONS).map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}
+          </select>
+          <select id="new-row-variety" class="tap-target rounded-md bg-slate-900 border border-slate-600 px-2 text-sm text-slate-100">
+            ${Object.entries(VARIETIES).map(([key, v]) => `<option value="${key}">${esc(v.label)}</option>`).join('')}
+          </select>
+        </div>
+        <input id="new-row-count" type="number" min="1" value="8" placeholder="Número de árboles"
+               class="tap-target w-full rounded-md bg-slate-900 border border-slate-600 px-2 text-sm text-slate-100" />
+        <div class="flex gap-2">
+          <button id="save-new-row" class="tap-target flex-1 rounded-md bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-medium">Guardar</button>
+          <button id="cancel-new-row" class="tap-target flex-1 rounded-md bg-slate-700 hover:bg-slate-600 text-white text-sm font-medium">Cancelar</button>
+        </div>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+
+  $$('.census-row-card', panel).forEach(btn =>
+    btn.addEventListener('click', () => {
+      const rowId = Number(btn.dataset.censusRow);
+      const stash2 = loadCensusStash();
+      if (stash2 && stash2.rowId !== rowId &&
+          !confirm(`Hay un censo sin terminar de la Hilera ${stash2.rowId}. ¿Descartarlo y empezar con la Hilera ${rowId}?`)) return;
+      censusSession = { rowId, pos: 1, answers: {} };
+      saveCensusStash();
+      renderCensus();
+    }));
+
+  if (stash) {
+    $('#census-resume').addEventListener('click', () => {
+      censusSession = stash;
+      renderCensus();
+    });
+    $('#census-discard').addEventListener('click', () => {
+      if (!confirm('¿Descartar el censo sin terminar? Las respuestas no guardadas se perderán.')) return;
+      clearCensusStash();
+      renderCensus();
+    });
+  }
+
+  $('#census-add-row').addEventListener('click', () => {
+    $('#census-add-row-form').classList.toggle('hidden');
+  });
+  $('#cancel-new-row').addEventListener('click', () => $('#census-add-row-form').classList.add('hidden'));
+  $('#save-new-row').addEventListener('click', async () => {
+    const sectionId = Number($('#new-row-section').value);
+    const varietyKey = $('#new-row-variety').value;
+    const count = Math.max(1, Number($('#new-row-count').value) || 1);
+    const newId = Math.max(...ORCHARD_DATA.rows.map(r => r.id)) + 1;
+    if (!confirm(`Se creará la Hilera ${newId} en ${SECTIONS[sectionId].name} con ${count} árboles. ¿Continuar?`)) return;
+    const payload = {
+      id: newId, section_id: sectionId, variety_key: varietyKey,
+      tree_count: count, age: 0, notes: '',
+      variety_confirmed_at: varietyKey === 'unconfirmed' ? null : new Date().toISOString().slice(0, 10),
+    };
+    const { error } = await supabase.from('rows').insert(payload);
+    if (error) {
+      console.error('Row insert failed', error);
+      showSaveError('No se pudo crear la hilera — revisa tu conexión e intenta de nuevo.');
+      return;
+    }
+    ORCHARD_DATA.rows.push({
+      id: newId, sectionId, variety: varietyKey, treeCount: count, age: 0,
+      notes: '', varietyConfirmedAt: payload.variety_confirmed_at || undefined, log: [],
+    });
+    ORCHARD_DATA.rows.sort((a, b) => a.id - b.id);
+    markSaved();
+    renderCensus(); renderMap(); renderInventory();
+  });
+}
+
+function renderCensusTree(row) {
+  const panel = $('#tab-census');
+  const pos = censusSession.pos;
+  const { states, health } = deriveTreePositions(row);
+  const prev = censusSession.answers[pos]; // revisiting via "atrás"
+  const curState = prev?.state ?? states[pos - 1];
+  const curHealth = prev?.health ?? health[pos - 1];
+  const pct = Math.round(((pos - 1) / row.treeCount) * 100);
+
+  const stateButtons = Object.entries(TREE_STATE_LABELS).map(([key, label]) =>
+    `<button data-census-state="${key}" class="tap-target rounded-md border px-2 py-2 text-sm font-medium transition ${TREE_STATE_CLASSES[key]} ${key === curState ? 'ring-2 ring-white' : 'opacity-60'}">${esc(label)}</button>`
+  ).join('');
+  const healthButtons = Object.entries(HEALTH_LABELS).map(([key, label]) =>
+    `<button data-census-health="${key}" class="tap-target rounded-md border border-slate-600 bg-slate-900 px-2 py-2 text-sm font-medium text-slate-200 transition ${key === curHealth ? 'ring-2 ring-white' : 'opacity-60'}">${esc(label)}</button>`
+  ).join('');
+
+  panel.innerHTML = `
+    <div class="rounded-xl border border-slate-700 bg-slate-800 p-4 space-y-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <h2 class="font-semibold text-lg">Hilera ${row.id} — Árbol ${pos} de ${row.treeCount}</h2>
+          <p class="text-xs text-slate-400">${esc((VARIETIES[row.variety] || {}).label || row.variety)}</p>
+        </div>
+        <button id="census-exit" title="Salir (se guarda el avance)" class="tap-target p-2 -m-2 text-slate-400 hover:text-white">
+          <i data-lucide="x" class="w-5 h-5"></i>
+        </button>
+      </div>
+      <div class="h-1.5 rounded-full bg-slate-700 overflow-hidden">
+        <div class="h-full bg-emerald-500" style="width:${pct}%"></div>
+      </div>
+
+      <div>
+        <div class="text-[11px] text-slate-500 mb-1.5">Estado</div>
+        <div class="grid grid-cols-2 sm:grid-cols-3 gap-1.5">${stateButtons}</div>
+      </div>
+      <div>
+        <div class="text-[11px] text-slate-500 mb-1.5">Salud</div>
+        <div class="grid grid-cols-2 sm:grid-cols-3 gap-1.5">${healthButtons}</div>
+      </div>
+      <input id="census-note" type="text" placeholder="Nota sobre este árbol (opcional)" value="${esc(prev?.note || '')}"
+             class="tap-target w-full rounded-md bg-slate-900 border border-slate-600 px-2 text-sm text-slate-100" />
+
+      <div class="flex gap-2">
+        <button id="census-back" ${pos === 1 ? 'disabled' : ''} class="tap-target rounded-md bg-slate-700 hover:bg-slate-600 disabled:opacity-40 text-white px-3">
+          <i data-lucide="chevron-left" class="w-5 h-5"></i>
+        </button>
+        <button id="census-skip" class="tap-target flex-1 rounded-md bg-slate-700 hover:bg-slate-600 text-white text-sm font-medium">No sé / Saltar</button>
+        <button id="census-next" class="tap-target flex-1 rounded-md bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-medium">Guardar y seguir</button>
+      </div>
+      ${pos > 1 ? `<button id="census-end-here" class="tap-target w-full rounded-md border border-red-800 text-red-400 hover:bg-red-900/30 text-xs font-medium py-2">La hilera termina aquí (quedan ${pos - 1} árboles)</button>` : ''}
+    </div>
+  `;
+  lucide.createIcons();
+
+  let selState = curState;
+  let selHealth = curHealth;
+  const highlight = () => {
+    $$('[data-census-state]', panel).forEach(b => {
+      const on = b.dataset.censusState === selState;
+      b.classList.toggle('ring-2', on); b.classList.toggle('ring-white', on); b.classList.toggle('opacity-60', !on);
+    });
+    $$('[data-census-health]', panel).forEach(b => {
+      const on = b.dataset.censusHealth === selHealth;
+      b.classList.toggle('ring-2', on); b.classList.toggle('ring-white', on); b.classList.toggle('opacity-60', !on);
+    });
+  };
+  $$('[data-census-state]', panel).forEach(b =>
+    b.addEventListener('click', () => { selState = b.dataset.censusState; highlight(); }));
+  $$('[data-census-health]', panel).forEach(b =>
+    b.addEventListener('click', () => { selHealth = b.dataset.censusHealth; highlight(); }));
+
+  $('#census-next').addEventListener('click', () => {
+    censusSession.answers[pos] = { state: selState, health: selHealth, note: $('#census-note').value.trim() };
+    censusSession.pos = pos + 1;
+    saveCensusStash();
+    renderCensus();
+  });
+  $('#census-skip').addEventListener('click', () => {
+    censusSession.answers[pos] = null;
+    censusSession.pos = pos + 1;
+    saveCensusStash();
+    renderCensus();
+  });
+  $('#census-back').addEventListener('click', () => {
+    if (pos > 1) { censusSession.pos = pos - 1; saveCensusStash(); renderCensus(); }
+  });
+  $('#census-exit').addEventListener('click', () => {
+    censusSession = null; // stash stays in localStorage for the resume banner
+    renderCensus();
+  });
+  const endBtn = $('#census-end-here');
+  if (endBtn) endBtn.addEventListener('click', async () => {
+    const newCount = pos - 1;
+    if (!confirm(`¿La Hilera ${row.id} tiene solo ${newCount} árboles? El conteo se corregirá y el censo terminará aquí.`)) return;
+    const ok = await updateRowCore(row, { tree_count: newCount });
+    if (!ok) { showSaveError('No se pudo corregir el conteo — revisa tu conexión.'); return; }
+    row.treeCount = newCount;
+    for (const p of Object.keys(censusSession.answers)) if (Number(p) > newCount) delete censusSession.answers[p];
+    censusSession.pos = newCount + 1;
+    saveCensusStash();
+    markSaved();
+    renderCensus();
+  });
+}
+
+function renderCensusEnd(row) {
+  const panel = $('#tab-census');
+  const entries = Object.entries(censusSession.answers).filter(([p]) => Number(p) <= row.treeCount);
+  const reviewed = entries.filter(([, a]) => a !== null).length;
+  const skipped = entries.filter(([, a]) => a === null).length;
+
+  panel.innerHTML = `
+    <div class="rounded-xl border border-slate-700 bg-slate-800 p-4 space-y-4 text-center">
+      <i data-lucide="flag" class="w-8 h-8 mx-auto text-emerald-500"></i>
+      <h2 class="font-semibold text-lg">Fin de la Hilera ${row.id}</h2>
+      <p class="text-sm text-slate-400">${reviewed} revisado(s) · ${skipped} saltado(s) · de ${row.treeCount} árboles</p>
+      <div class="space-y-2">
+        <button id="census-add-tree" class="tap-target w-full rounded-md border border-slate-600 text-slate-300 hover:bg-slate-700 text-sm font-medium py-2">
+          Hay un árbol más — agregar (+1)
+        </button>
+        <button id="census-finish" class="tap-target w-full rounded-md bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-medium py-2">
+          Guardar censo de la hilera
+        </button>
+        <button id="census-abort" class="tap-target w-full rounded-md bg-slate-700 hover:bg-slate-600 text-white text-xs font-medium py-2">
+          Cancelar (no guardar nada)
+        </button>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+
+  $('#census-add-tree').addEventListener('click', async () => {
+    const newCount = row.treeCount + 1;
+    const ok = await updateRowCore(row, { tree_count: newCount });
+    if (!ok) { showSaveError('No se pudo agregar el árbol — revisa tu conexión.'); return; }
+    row.treeCount = newCount;
+    censusSession.pos = newCount; // go census the new tree
+    saveCensusStash();
+    markSaved();
+    renderCensus();
+  });
+  $('#census-finish').addEventListener('click', () => finishCensusRow(row));
+  $('#census-abort').addEventListener('click', () => {
+    if (!confirm('¿Cancelar el censo de esta hilera? Las respuestas no se guardarán.')) return;
+    clearCensusStash();
+    renderCensus();
+  });
+}
+
+async function finishCensusRow(row) {
+  const today = new Date().toISOString().slice(0, 10);
+  const { states, health } = deriveTreePositions(row);
+
+  // Only record changes; the Census event documents what was reviewed.
+  const stateGroups = {};  // status -> { positions, notes }
+  const healthGroups = {};
+  const reviewedPositions = [];
+  for (const [pStr, a] of Object.entries(censusSession.answers)) {
+    const p = Number(pStr);
+    if (p < 1 || p > row.treeCount) continue;
+    if (a === null) continue; // saltado
+    reviewedPositions.push(p);
+    if (a.state !== states[p - 1]) {
+      (stateGroups[a.state] ??= { positions: [], notes: [] }).positions.push(p);
+      if (a.note) stateGroups[a.state].notes.push(`Árbol ${p}: ${a.note}`);
+    }
+    if (a.health !== health[p - 1]) {
+      (healthGroups[a.health] ??= { positions: [], notes: [] }).positions.push(p);
+      if (a.note) healthGroups[a.health].notes.push(`Árbol ${p}: ${a.note}`);
+    }
+    // a note on an unchanged tree still deserves recording
+    if (a.note && a.state === states[p - 1] && a.health === health[p - 1]) {
+      (stateGroups[a.state] ??= { positions: [], notes: [] });
+      if (!stateGroups[a.state].positions.includes(p)) stateGroups[a.state].positions.push(p);
+      stateGroups[a.state].notes.push(`Árbol ${p}: ${a.note}`);
+    }
+  }
+  reviewedPositions.sort((a, b) => a - b);
+
+  const inserts = [];
+  for (const [status, g] of Object.entries(stateGroups)) {
+    inserts.push({ date: today, type: 'Tree State', status, positions: g.positions.sort((a, b) => a - b), text: g.notes.join('; ') });
+  }
+  for (const [status, g] of Object.entries(healthGroups)) {
+    inserts.push({ date: today, type: 'Health', status, positions: g.positions.sort((a, b) => a - b), text: g.notes.join('; ') });
+  }
+  inserts.push({
+    date: today, type: 'Census',
+    positions: reviewedPositions.length ? reviewedPositions : null,
+    text: `Censo: ${reviewedPositions.length} de ${row.treeCount} árboles revisados`,
+  });
+
+  for (const entry of inserts) {
+    const ok = await insertRowEventCore(row, entry);
+    if (!ok) {
+      showSaveError('No se pudo guardar el censo completo — revisa tu conexión e intenta "Guardar censo" de nuevo.');
+      return; // stash intact; the user can retry
+    }
+  }
+
+  clearCensusStash();
+  markSaved();
+  renderCensus(); renderMap(); renderInventory();
 }
 
 // ---------- Tasks tab ----------
@@ -943,6 +1334,7 @@ async function refreshData({ silent = false } = {}) {
   try {
     await fetchAllData();
     renderMap();
+    renderCensus();
     renderTasks();
     renderInventory();
     if (!silent) markSaved();
