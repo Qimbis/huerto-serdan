@@ -892,7 +892,7 @@ function renderCensusTree(row) {
         <button id="census-skip" class="tap-target flex-1 rounded-md bg-slate-700 hover:bg-slate-600 text-white text-sm font-medium">No sé / Saltar</button>
         <button id="census-next" class="tap-target flex-1 rounded-md bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-medium">Guardar y seguir</button>
       </div>
-      ${pos > 1 ? `<button id="census-end-here" class="tap-target w-full rounded-md border border-red-800 text-red-400 hover:bg-red-900/30 text-xs font-medium py-2">La hilera termina aquí (quedan ${pos - 1} árboles)</button>` : ''}
+      ${pos > 1 ? `<button id="census-end-here" class="tap-target w-full rounded-md border border-red-800 text-red-400 hover:bg-red-900/30 text-xs font-medium py-2">La hilera termina aquí — corregir el conteo a ${pos - 1} árboles</button>` : ''}
     </div>
   `;
   lucide.createIcons();
