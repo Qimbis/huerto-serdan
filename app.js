@@ -44,10 +44,48 @@ const LOG_TYPE_LABELS = {
   'Variety Confirmed': 'Variedad confirmada',
   'Pruning': 'Poda',
   'Frost/Hail Damage': 'Daño por helada/granizo',
+  'Tree State': 'Estado de árboles',
+  'Health': 'Salud',
   'Other': 'Otro',
 };
 const labelForLogType = t => LOG_TYPE_LABELS[t] || t;
-const LOG_TYPES = Object.keys(LOG_TYPE_LABELS);
+// 'Tree State' / 'Health' events carry tree positions, so they are created
+// from the tree grid, not the free-form history dropdown
+const LOG_TYPES = Object.keys(LOG_TYPE_LABELS).filter(t => t !== 'Tree State' && t !== 'Health');
+
+// Per-tree alive-state ('Tree State' events) — data keys English, labels Spanish
+const TREE_STATE_LABELS = {
+  'ok': 'Bien',
+  'graft-rejected': 'Injerto rechazado',
+  'lost-gopher': 'Perdido (topo)',
+  'replanted': 'Replantado',
+  'empty': 'Vacío',
+};
+const TREE_STATE_CLASSES = {
+  'ok': 'bg-emerald-700/80 border-emerald-500 text-emerald-100',
+  'graft-rejected': 'bg-amber-700/80 border-amber-500 text-amber-100',
+  'lost-gopher': 'bg-red-700/80 border-red-500 text-red-100',
+  'replanted': 'bg-sky-700/80 border-sky-500 text-sky-100',
+  'empty': 'bg-slate-800 border-slate-600 text-slate-500',
+};
+
+// Per-tree health ('Health' events)
+const HEALTH_LABELS = {
+  'healthy': 'Sano',
+  'stressed': 'Estresado',
+  'diseased': 'Enfermo',
+  'pest': 'Plaga',
+  'recovering': 'En recuperación',
+};
+const HEALTH_DOT_CLASSES = {
+  'stressed': 'bg-amber-400',
+  'diseased': 'bg-red-400',
+  'pest': 'bg-fuchsia-400',
+  'recovering': 'bg-sky-400',
+  // 'healthy' draws no dot — it is the quiet default
+};
+const labelForTreeState = s => TREE_STATE_LABELS[s] || s;
+const labelForHealth = s => HEALTH_LABELS[s] || s;
 
 const TASK_STATUS_LABELS = { Pending: 'Pendiente', 'In Progress': 'En progreso', Completed: 'Completada' };
 const labelForStatus = s => TASK_STATUS_LABELS[s] || s;
@@ -87,6 +125,31 @@ const REFETCH_THROTTLE_MS = 30_000;
 
 function rowsBySection(sectionId) {
   return ORCHARD_DATA.rows.filter(r => r.sectionId === sectionId);
+}
+
+// Derive per-tree state from the append-only event log. Position N's state
+// is the status of the latest 'Tree State' event covering N (default 'ok');
+// health likewise from 'Health' events; replantedAt is the date of the most
+// recent replant, which (falling back to the row's plantedAt) gives the
+// tree's effective age. row.log is already sorted oldest→newest.
+function deriveTreePositions(row) {
+  const n = row.treeCount;
+  const states = Array(n).fill('ok');
+  const health = Array(n).fill('healthy');
+  const replantedAt = Array(n).fill(null);
+  for (const e of row.log) {
+    if (!e.positions || !e.status) continue;
+    for (const p of e.positions) {
+      if (p < 1 || p > n) continue; // event predates a count correction
+      if (e.type === 'Tree State') {
+        states[p - 1] = e.status;
+        if (e.status === 'replanted') replantedAt[p - 1] = e.date;
+      } else if (e.type === 'Health') {
+        health[p - 1] = e.status;
+      }
+    }
+  }
+  return { states, health, replantedAt };
 }
 
 function stageBadgeClass(stage) {
@@ -351,6 +414,8 @@ function openRowDetail(rowId) {
                   class="mt-1 w-full rounded-md bg-slate-900 border border-slate-600 px-2 py-1.5 text-sm text-slate-100">${esc(row.notes || '')}</textarea>
       </label>
 
+      ${renderTreeGrid(row)}
+
       <div>
         <h4 class="text-sm font-medium text-slate-300 mb-2">Historial</h4>
         <div class="space-y-1.5 max-h-40 overflow-y-auto mb-3">
@@ -360,6 +425,8 @@ function openRowDetail(rowId) {
                 <div class="text-xs border border-slate-700 rounded-md px-2 py-1.5">
                   <span class="text-slate-500">${esc(entry.date)}</span>
                   <span class="text-slate-300 font-medium ml-1">${esc(labelForLogType(entry.type))}</span>
+                  ${entry.status ? `<span class="text-slate-400 ml-1">— ${esc(entry.type === 'Health' ? labelForHealth(entry.status) : labelForTreeState(entry.status))}</span>` : ''}
+                  ${entry.positions?.length ? `<p class="text-slate-500 mt-0.5">Árboles: ${entry.positions.join(', ')}</p>` : ''}
                   ${entry.text ? `<p class="text-slate-400 mt-0.5">${esc(entry.text)}</p>` : ''}
                 </div>
               `).join('')}
@@ -381,6 +448,7 @@ function openRowDetail(rowId) {
   lucide.createIcons();
   $('#row-detail-backdrop').classList.remove('hidden');
   $('#close-row-detail').addEventListener('click', closeRowDetail);
+  wireTreeGrid(row);
 
   $$('[data-field]', $('#row-detail-panel')).forEach(el => {
     el.addEventListener('change', () => {
@@ -463,6 +531,8 @@ async function insertRowEventRemote(row, entry) {
     event_date: entry.date,
     type: entry.type,
     note: entry.text || '',
+    tree_positions: entry.positions || null,
+    status: entry.status || null,
     created_by: currentUser?.id ?? null,
   };
   const { data, error } = await supabase.from('row_events').insert(payload).select().single();
@@ -471,13 +541,110 @@ async function insertRowEventRemote(row, entry) {
     showSaveError('No se pudo guardar la entrada del historial — revisa tu conexión e intenta de nuevo.');
     return;
   }
-  row.log.push({ date: data.event_date, type: data.type, text: data.note });
+  row.log.push({
+    date: data.event_date, type: data.type, text: data.note,
+    positions: data.tree_positions || undefined,
+    status: data.status || undefined,
+  });
   markSaved();
   openRowDetail(row.id);
 }
 
 function closeRowDetail() {
   $('#row-detail-backdrop').classList.add('hidden');
+}
+
+// ---------- Per-tree grid (Fase 3: estado y salud por árbol) ----------
+function renderTreeGrid(row) {
+  const { states, health, replantedAt } = deriveTreePositions(row);
+
+  const cells = Array.from({ length: row.treeCount }, (_, i) => {
+    const p = i + 1;
+    const state = states[i];
+    const h = health[i];
+    const dot = HEALTH_DOT_CLASSES[h]
+      ? `<span class="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full ${HEALTH_DOT_CLASSES[h]}"></span>`
+      : '';
+    const planted = replantedAt[i] || row.plantedAt;
+    const title = `Árbol ${p} — ${labelForTreeState(state)} · ${labelForHealth(h)}${planted ? ` · plantado ${planted}` : ''}`;
+    return `<button data-pos="${p}" title="${esc(title)}"
+                    class="tree-cell relative w-9 h-9 rounded border text-[11px] font-medium transition
+                           ${TREE_STATE_CLASSES[state] || TREE_STATE_CLASSES.ok}">${p}${dot}</button>`;
+  }).join('');
+
+  const legend = Object.entries(TREE_STATE_LABELS).map(([key, label]) =>
+    `<span class="inline-flex items-center gap-1 text-[11px] text-slate-400">
+       <span class="w-2.5 h-2.5 rounded border inline-block ${TREE_STATE_CLASSES[key]}"></span>${esc(label)}
+     </span>`
+  ).join('');
+
+  const stateButtons = Object.entries(TREE_STATE_LABELS).map(([key, label]) =>
+    `<button data-tree-state="${key}" class="tap-target rounded-md border px-2 py-1.5 text-xs font-medium ${TREE_STATE_CLASSES[key]}">${esc(label)}</button>`
+  ).join('');
+
+  const healthButtons = Object.entries(HEALTH_LABELS).map(([key, label]) =>
+    `<button data-tree-health="${key}" class="tap-target rounded-md border border-slate-600 bg-slate-900 px-2 py-1.5 text-xs font-medium text-slate-200">${esc(label)}</button>`
+  ).join('');
+
+  return `
+    <div>
+      <h4 class="text-sm font-medium text-slate-300 mb-1">Árboles <span class="text-xs font-normal text-slate-500">— toca uno o varios para marcar</span></h4>
+      <div class="flex flex-wrap gap-2 mb-2">${legend}</div>
+      <div id="tree-grid" class="flex flex-wrap gap-1">${cells}</div>
+      <div id="tree-actions" class="hidden mt-3 rounded-lg border border-slate-600 bg-slate-900/70 p-3 space-y-2">
+        <div class="text-xs text-slate-400"><span id="tree-selected-count"></span> seleccionado(s)</div>
+        <div class="text-[11px] text-slate-500">Estado</div>
+        <div class="flex flex-wrap gap-1.5">${stateButtons}</div>
+        <div class="text-[11px] text-slate-500">Salud</div>
+        <div class="flex flex-wrap gap-1.5">${healthButtons}</div>
+        <input id="tree-note" type="text" placeholder="Detalles (opcional)"
+               class="tap-target w-full rounded-md bg-slate-900 border border-slate-600 px-2 text-sm text-slate-100" />
+        <button id="tree-cancel" class="tap-target w-full rounded-md bg-slate-700 hover:bg-slate-600 text-white text-xs font-medium">Cancelar selección</button>
+      </div>
+    </div>
+  `;
+}
+
+function wireTreeGrid(row) {
+  const grid = $('#tree-grid');
+  if (!grid) return;
+  const selected = new Set();
+
+  const syncUi = () => {
+    $$('.tree-cell', grid).forEach(cell => {
+      const p = Number(cell.dataset.pos);
+      cell.classList.toggle('ring-2', selected.has(p));
+      cell.classList.toggle('ring-white', selected.has(p));
+    });
+    $('#tree-actions').classList.toggle('hidden', selected.size === 0);
+    $('#tree-selected-count').textContent = selected.size;
+  };
+
+  $$('.tree-cell', grid).forEach(cell => {
+    cell.addEventListener('click', () => {
+      const p = Number(cell.dataset.pos);
+      if (selected.has(p)) selected.delete(p); else selected.add(p);
+      syncUi();
+    });
+  });
+
+  const apply = (type, status) => {
+    if (selected.size === 0) return;
+    insertRowEventRemote(row, {
+      date: new Date().toISOString().slice(0, 10),
+      type,
+      status,
+      positions: [...selected].sort((a, b) => a - b),
+      text: $('#tree-note').value.trim(),
+    });
+    // insertRowEventRemote re-renders the panel, which clears the selection
+  };
+
+  $$('[data-tree-state]').forEach(btn =>
+    btn.addEventListener('click', () => apply('Tree State', btn.dataset.treeState)));
+  $$('[data-tree-health]').forEach(btn =>
+    btn.addEventListener('click', () => apply('Health', btn.dataset.treeHealth)));
+  $('#tree-cancel').addEventListener('click', () => { selected.clear(); syncUi(); });
 }
 
 // ---------- Tasks tab ----------
@@ -527,7 +694,7 @@ function renderTasks() {
         <select id="new-task-category" class="tap-target rounded-md bg-slate-900 border border-slate-600 px-2 text-sm text-slate-100">
           ${TASK_CATEGORIES.map(c => `<option value="${c}">${esc(labelForCategory(c))}</option>`).join('')}
         </select>
-        <input id="new-task-row" type="number" min="1" max="40" placeholder="Hilera (opcional)"
+        <input id="new-task-row" type="number" min="1" placeholder="Hilera (opcional)"
                class="tap-target rounded-md bg-slate-900 border border-slate-600 px-2 text-sm text-slate-100" />
       </div>
       <div class="flex gap-2">
@@ -560,8 +727,8 @@ function renderTasks() {
       let rowId = null;
       if (rowValRaw !== '') {
         const n = Number(rowValRaw);
-        if (!Number.isInteger(n) || n < 1 || n > 40) {
-          alert('El número de hilera debe estar entre 1 y 40.');
+        if (!Number.isInteger(n) || !ORCHARD_DATA.rows.some(r => r.id === n)) {
+          alert('Esa hilera no existe.');
           return;
         }
         rowId = n;
@@ -743,7 +910,11 @@ async function fetchAllData() {
 
   const eventsByRow = {};
   for (const e of eventsRes.data) {
-    (eventsByRow[e.row_id] ??= []).push({ date: e.event_date, type: e.type, text: e.note });
+    (eventsByRow[e.row_id] ??= []).push({
+      date: e.event_date, type: e.type, text: e.note,
+      positions: e.tree_positions || undefined,
+      status: e.status || undefined,
+    });
   }
 
   ORCHARD_DATA.rows = rowsRes.data
@@ -755,6 +926,7 @@ async function fetchAllData() {
       age: r.age,
       notes: r.notes || '',
       varietyConfirmedAt: r.variety_confirmed_at || undefined,
+      plantedAt: r.planted_at || undefined,
       log: eventsByRow[r.id] || [],
     }))
     .sort((a, b) => a.id - b.id);
