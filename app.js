@@ -88,6 +88,15 @@ const HEALTH_DOT_CLASSES = {
 const labelForTreeState = s => TREE_STATE_LABELS[s] || s;
 const labelForHealth = s => HEALTH_LABELS[s] || s;
 
+// Loss/replant report — cause colors match the tree-grid entities but use
+// darker steps validated for contrast + CVD separation on the slate surfaces
+const LOSS_CAUSE_META = {
+  'lost-gopher':    { label: 'Perdido (topo)',    color: '#ef4444' },
+  'graft-rejected': { label: 'Injerto rechazado', color: '#d97706' },
+  'replanted':      { label: 'Replantado',        color: '#0284c7' },
+};
+const LOSS_CAUSES = Object.keys(LOSS_CAUSE_META);
+
 const TASK_STATUS_LABELS = { Pending: 'Pendiente', 'In Progress': 'En progreso', Completed: 'Completada' };
 const labelForStatus = s => TASK_STATUS_LABELS[s] || s;
 
@@ -566,6 +575,7 @@ async function insertRowEventRemote(row, entry) {
     return;
   }
   markSaved();
+  renderInventory(); // loss report reflects new tree-state events immediately
   openRowDetail(row.id);
 }
 
@@ -1180,6 +1190,112 @@ function renderTasks() {
   });
 }
 
+// ---------- Loss/replant trend report (Fase 5) ----------
+function collectLossData() {
+  const byMonth = {};   // 'YYYY-MM' -> { cause: n }
+  const bySection = {}; // sectionId -> { cause: n }
+  for (const row of ORCHARD_DATA.rows) {
+    for (const e of row.log) {
+      let cause = null;
+      if (e.type === 'Tree State' && LOSS_CAUSE_META[e.status]) cause = e.status;
+      else if (e.type === 'Gopher Loss') cause = 'lost-gopher';      // legacy manual entries,
+      else if (e.type === 'Graft Rejected') cause = 'graft-rejected'; // counted as 1 tree if no positions
+      if (!cause) continue;
+      const month = (e.date || '').slice(0, 7);
+      if (month.length !== 7) continue;
+      const n = e.positions?.length ?? 1;
+      const m = (byMonth[month] ??= {});
+      m[cause] = (m[cause] || 0) + n;
+      const s = (bySection[row.sectionId] ??= {});
+      s[cause] = (s[cause] || 0) + n;
+    }
+  }
+  return { byMonth, bySection };
+}
+
+function renderLossReport() {
+  const { byMonth, bySection } = collectLossData();
+  const anyData = Object.keys(byMonth).length > 0;
+
+  const legend = LOSS_CAUSES.map(c =>
+    `<span class="inline-flex items-center gap-1.5 text-[11px] text-slate-400">
+       <span class="w-2.5 h-2.5 rounded-sm inline-block" style="background:${LOSS_CAUSE_META[c].color}"></span>${LOSS_CAUSE_META[c].label}
+     </span>`).join('');
+
+  // last 12 calendar months, oldest first
+  const buckets = [];
+  const now = new Date();
+  for (let i = 11; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    buckets.push({
+      key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`,
+      label: d.toLocaleDateString('es-MX', { month: 'short' }),
+    });
+  }
+  const totals = buckets.map(b => LOSS_CAUSES.reduce((s, c) => s + (byMonth[b.key]?.[c] || 0), 0));
+  const maxTotal = Math.max(...totals, 1);
+  const CHART_H = 96;
+
+  // DOM top→bottom = replanted, graft-rejected, lost-gopher — gopher (the
+  // headline cause) anchors the baseline in every column
+  const stackOrder = [...LOSS_CAUSES].reverse();
+  const columns = buckets.map((b, i) => {
+    const total = totals[i];
+    const segs = stackOrder.filter(c => byMonth[b.key]?.[c]).map((c, idx) => {
+      const n = byMonth[b.key][c];
+      const h = Math.max(3, Math.round((n / maxTotal) * CHART_H));
+      return `<div title="${LOSS_CAUSE_META[c].label}: ${n}" style="height:${h}px;background:${LOSS_CAUSE_META[c].color}" class="w-full ${idx === 0 ? 'rounded-t' : ''}"></div>`;
+    }).join('');
+    return `
+      <div class="flex-1 flex flex-col items-center justify-end">
+        ${total > 0 ? `<div class="text-[10px] text-slate-400 mb-0.5">${total}</div>` : ''}
+        <div class="w-full max-w-[22px] flex flex-col justify-end gap-0.5" style="min-height:0">${segs}</div>
+        <div class="text-[10px] text-slate-500 mt-1">${b.label}</div>
+      </div>`;
+  }).join('');
+
+  const maxSection = Math.max(1, ...Object.values(SECTIONS).map(s =>
+    LOSS_CAUSES.reduce((sum, c) => sum + ((bySection[s.id] || {})[c] || 0), 0)));
+  const sectionBars = Object.values(SECTIONS).map(s => {
+    const data = bySection[s.id] || {};
+    const total = LOSS_CAUSES.reduce((sum, c) => sum + (data[c] || 0), 0);
+    const segs = LOSS_CAUSES.filter(c => data[c]).map(c =>
+      `<div title="${LOSS_CAUSE_META[c].label}: ${data[c]}" style="width:${(data[c] / maxSection) * 100}%;background:${LOSS_CAUSE_META[c].color}" class="h-3 rounded-sm"></div>`
+    ).join('');
+    return `
+      <div class="flex items-center gap-2 text-xs">
+        <span class="w-20 shrink-0 text-slate-400">${esc(s.name)}</span>
+        <div class="flex-1 flex gap-0.5 items-center">${segs || '<span class="text-slate-600">—</span>'}</div>
+        <span class="w-8 text-right text-slate-400">${total || ''}</span>
+      </div>`;
+  }).join('');
+
+  const monthsWithData = Object.keys(byMonth).sort();
+  const tableRows = monthsWithData.map(m =>
+    `<tr><td class="py-0.5 pr-4 text-slate-400">${m}</td>${LOSS_CAUSES.map(c => `<td class="py-0.5 pr-4 text-right text-slate-300">${byMonth[m][c] || ''}</td>`).join('')}</tr>`
+  ).join('');
+
+  return `
+    <div class="rounded-lg border border-slate-700 bg-slate-800 p-4 mt-3">
+      <h3 class="text-sm font-semibold text-slate-300 mb-1">Pérdidas y replantes — últimos 12 meses</h3>
+      ${!anyData ? `
+        <p class="text-xs text-slate-500 mt-2">Sin registros todavía. Los árboles marcados como perdidos, rechazados o replantados (desde el censo o la cuadrícula de cada hilera) aparecerán aquí por mes y por sección.</p>
+      ` : `
+        <div class="flex flex-wrap gap-3 mt-1 mb-3">${legend}</div>
+        <div class="flex items-end gap-1">${columns}</div>
+        <h4 class="text-xs font-medium text-slate-400 mt-4 mb-2">Por sección — total histórico</h4>
+        <div class="space-y-1.5">${sectionBars}</div>
+        <details class="mt-3">
+          <summary class="text-[11px] text-slate-500 cursor-pointer">Ver tabla</summary>
+          <table class="text-[11px] mt-2">
+            <thead><tr><th class="text-left pr-4 font-normal text-slate-500">Mes</th>${LOSS_CAUSES.map(c => `<th class="text-right pr-4 font-normal text-slate-500">${LOSS_CAUSE_META[c].label}</th>`).join('')}</tr></thead>
+            <tbody>${tableRows}</tbody>
+          </table>
+        </details>
+      `}
+    </div>`;
+}
+
 // ---------- Inventory tab ----------
 function renderInventory() {
   const inv = ORCHARD_DATA.inventory;
@@ -1262,6 +1378,8 @@ function renderInventory() {
         }).join('')}
       </div>
     </div>
+
+    ${renderLossReport()}
   `;
 }
 
