@@ -46,13 +46,15 @@ const LOG_TYPE_LABELS = {
   'Frost/Hail Damage': 'Daño por helada/granizo',
   'Tree State': 'Estado de árboles',
   'Health': 'Salud',
+  'Vigor': 'Vigor',
   'Census': 'Censo',
   'Other': 'Otro',
 };
 const labelForLogType = t => LOG_TYPE_LABELS[t] || t;
-// 'Tree State' / 'Health' / 'Census' events carry tree positions, so they
-// are created from the tree grid or census flow, not the history dropdown
-const LOG_TYPES = Object.keys(LOG_TYPE_LABELS).filter(t => !['Tree State', 'Health', 'Census'].includes(t));
+// Position-carrying event types come from the tree grid or census flow,
+// not the free-form history dropdown
+const POSITION_EVENT_TYPES = ['Tree State', 'Health', 'Vigor', 'Census'];
+const LOG_TYPES = Object.keys(LOG_TYPE_LABELS).filter(t => !POSITION_EVENT_TYPES.includes(t));
 
 // Per-tree alive-state ('Tree State' events) — data keys English, labels Spanish
 const TREE_STATE_LABELS = {
@@ -85,8 +87,16 @@ const HEALTH_DOT_CLASSES = {
   'recovering': 'bg-sky-400',
   // 'healthy' draws no dot — it is the quiet default
 };
+
+// Per-tree vigor ('Vigor' events) — is this tree keeping up with its row?
+const VIGOR_LABELS = {
+  'normal': 'Normal',
+  'ahead': 'Adelantado',
+  'behind': 'Atrasado',
+};
 const labelForTreeState = s => TREE_STATE_LABELS[s] || s;
 const labelForHealth = s => HEALTH_LABELS[s] || s;
+const labelForVigor = s => VIGOR_LABELS[s] || s;
 
 // Loss/replant report — cause colors match the tree-grid entities but use
 // darker steps validated for contrast + CVD separation on the slate surfaces
@@ -146,6 +156,7 @@ function deriveTreePositions(row) {
   const n = row.treeCount;
   const states = Array(n).fill('ok');
   const health = Array(n).fill('healthy');
+  const vigor = Array(n).fill('normal');
   const replantedAt = Array(n).fill(null);
   for (const e of row.log) {
     if (!e.positions || !e.status) continue;
@@ -156,10 +167,12 @@ function deriveTreePositions(row) {
         if (e.status === 'replanted') replantedAt[p - 1] = e.date;
       } else if (e.type === 'Health') {
         health[p - 1] = e.status;
+      } else if (e.type === 'Vigor') {
+        vigor[p - 1] = e.status;
       }
     }
   }
-  return { states, health, replantedAt };
+  return { states, health, vigor, replantedAt };
 }
 
 function stageBadgeClass(stage) {
@@ -435,7 +448,7 @@ function openRowDetail(rowId) {
                 <div class="text-xs border border-slate-700 rounded-md px-2 py-1.5">
                   <span class="text-slate-500">${esc(entry.date)}</span>
                   <span class="text-slate-300 font-medium ml-1">${esc(labelForLogType(entry.type))}</span>
-                  ${entry.status ? `<span class="text-slate-400 ml-1">— ${esc(entry.type === 'Health' ? labelForHealth(entry.status) : labelForTreeState(entry.status))}</span>` : ''}
+                  ${entry.status ? `<span class="text-slate-400 ml-1">— ${esc(entry.type === 'Health' ? labelForHealth(entry.status) : entry.type === 'Vigor' ? labelForVigor(entry.status) : labelForTreeState(entry.status))}</span>` : ''}
                   ${entry.positions?.length ? `<p class="text-slate-500 mt-0.5">Árboles: ${entry.positions.join(', ')}</p>` : ''}
                   ${entry.text ? `<p class="text-slate-400 mt-0.5">${esc(entry.text)}</p>` : ''}
                 </div>
@@ -585,7 +598,7 @@ function closeRowDetail() {
 
 // ---------- Per-tree grid (Fase 3: estado y salud por árbol) ----------
 function renderTreeGrid(row) {
-  const { states, health, replantedAt } = deriveTreePositions(row);
+  const { states, health, vigor, replantedAt } = deriveTreePositions(row);
 
   const cells = Array.from({ length: row.treeCount }, (_, i) => {
     const p = i + 1;
@@ -595,7 +608,8 @@ function renderTreeGrid(row) {
       ? `<span class="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full ${HEALTH_DOT_CLASSES[h]}"></span>`
       : '';
     const planted = replantedAt[i] || row.plantedAt;
-    const title = `Árbol ${p} — ${labelForTreeState(state)} · ${labelForHealth(h)}${planted ? ` · plantado ${planted}` : ''}`;
+    const vigorNote = vigor[i] !== 'normal' ? ` · ${labelForVigor(vigor[i])}` : '';
+    const title = `Árbol ${p} — ${labelForTreeState(state)} · ${labelForHealth(h)}${vigorNote}${planted ? ` · plantado ${planted}` : ''}`;
     return `<button data-pos="${p}" title="${esc(title)}"
                     class="tree-cell relative w-9 h-9 rounded border text-[11px] font-medium transition
                            ${TREE_STATE_CLASSES[state] || TREE_STATE_CLASSES.ok}">${p}${dot}</button>`;
@@ -846,10 +860,11 @@ function renderCensusList() {
 function renderCensusTree(row) {
   const panel = $('#tab-census');
   const pos = censusSession.pos;
-  const { states, health } = deriveTreePositions(row);
+  const { states, health, vigor } = deriveTreePositions(row);
   const prev = censusSession.answers[pos]; // revisiting via "atrás"
   const curState = prev?.state ?? states[pos - 1];
   const curHealth = prev?.health ?? health[pos - 1];
+  const curVigor = prev?.vigor ?? vigor[pos - 1];
   const pct = Math.round(((pos - 1) / row.treeCount) * 100);
 
   const stateButtons = Object.entries(TREE_STATE_LABELS).map(([key, label]) =>
@@ -857,6 +872,9 @@ function renderCensusTree(row) {
   ).join('');
   const healthButtons = Object.entries(HEALTH_LABELS).map(([key, label]) =>
     `<button data-census-health="${key}" class="tap-target rounded-md border border-slate-600 bg-slate-900 px-2 py-2 text-sm font-medium text-slate-200 transition ${key === curHealth ? 'ring-2 ring-white' : 'opacity-60'}">${esc(label)}</button>`
+  ).join('');
+  const vigorButtons = Object.entries(VIGOR_LABELS).map(([key, label]) =>
+    `<button data-census-vigor="${key}" class="tap-target rounded-md border border-slate-600 bg-slate-900 px-2 py-2 text-sm font-medium text-slate-200 transition ${key === curVigor ? 'ring-2 ring-white' : 'opacity-60'}">${esc(label)}</button>`
   ).join('');
 
   panel.innerHTML = `
@@ -882,6 +900,10 @@ function renderCensusTree(row) {
         <div class="text-[11px] text-slate-500 mb-1.5">Salud</div>
         <div class="grid grid-cols-2 sm:grid-cols-3 gap-1.5">${healthButtons}</div>
       </div>
+      <div>
+        <div class="text-[11px] text-slate-500 mb-1.5">Vigor <span class="text-slate-600">— ¿va al ritmo de la hilera?</span></div>
+        <div class="grid grid-cols-3 gap-1.5">${vigorButtons}</div>
+      </div>
       <input id="census-note" type="text" placeholder="Nota sobre este árbol (opcional)" value="${esc(prev?.note || '')}"
              class="tap-target w-full rounded-md bg-slate-900 border border-slate-600 px-2 text-sm text-slate-100" />
 
@@ -899,6 +921,7 @@ function renderCensusTree(row) {
 
   let selState = curState;
   let selHealth = curHealth;
+  let selVigor = curVigor;
   const highlight = () => {
     $$('[data-census-state]', panel).forEach(b => {
       const on = b.dataset.censusState === selState;
@@ -908,14 +931,20 @@ function renderCensusTree(row) {
       const on = b.dataset.censusHealth === selHealth;
       b.classList.toggle('ring-2', on); b.classList.toggle('ring-white', on); b.classList.toggle('opacity-60', !on);
     });
+    $$('[data-census-vigor]', panel).forEach(b => {
+      const on = b.dataset.censusVigor === selVigor;
+      b.classList.toggle('ring-2', on); b.classList.toggle('ring-white', on); b.classList.toggle('opacity-60', !on);
+    });
   };
   $$('[data-census-state]', panel).forEach(b =>
     b.addEventListener('click', () => { selState = b.dataset.censusState; highlight(); }));
   $$('[data-census-health]', panel).forEach(b =>
     b.addEventListener('click', () => { selHealth = b.dataset.censusHealth; highlight(); }));
+  $$('[data-census-vigor]', panel).forEach(b =>
+    b.addEventListener('click', () => { selVigor = b.dataset.censusVigor; highlight(); }));
 
   $('#census-next').addEventListener('click', () => {
-    censusSession.answers[pos] = { state: selState, health: selHealth, note: $('#census-note').value.trim() };
+    censusSession.answers[pos] = { state: selState, health: selHealth, vigor: selVigor, note: $('#census-note').value.trim() };
     censusSession.pos = pos + 1;
     saveCensusStash();
     renderCensus();
@@ -994,17 +1023,19 @@ function renderCensusEnd(row) {
 
 async function finishCensusRow(row) {
   const today = new Date().toISOString().slice(0, 10);
-  const { states, health } = deriveTreePositions(row);
+  const { states, health, vigor } = deriveTreePositions(row);
 
   // Only record changes; the Census event documents what was reviewed.
   const stateGroups = {};  // status -> { positions, notes }
   const healthGroups = {};
+  const vigorGroups = {};
   const reviewedPositions = [];
   for (const [pStr, a] of Object.entries(censusSession.answers)) {
     const p = Number(pStr);
     if (p < 1 || p > row.treeCount) continue;
     if (a === null) continue; // saltado
     reviewedPositions.push(p);
+    const changed = a.state !== states[p - 1] || a.health !== health[p - 1] || (a.vigor ?? 'normal') !== vigor[p - 1];
     if (a.state !== states[p - 1]) {
       (stateGroups[a.state] ??= { positions: [], notes: [] }).positions.push(p);
       if (a.note) stateGroups[a.state].notes.push(`Árbol ${p}: ${a.note}`);
@@ -1013,8 +1044,13 @@ async function finishCensusRow(row) {
       (healthGroups[a.health] ??= { positions: [], notes: [] }).positions.push(p);
       if (a.note) healthGroups[a.health].notes.push(`Árbol ${p}: ${a.note}`);
     }
-    // a note on an unchanged tree still deserves recording
-    if (a.note && a.state === states[p - 1] && a.health === health[p - 1]) {
+    if ((a.vigor ?? 'normal') !== vigor[p - 1]) {
+      const v = a.vigor ?? 'normal';
+      (vigorGroups[v] ??= { positions: [], notes: [] }).positions.push(p);
+      if (a.note) vigorGroups[v].notes.push(`Árbol ${p}: ${a.note}`);
+    }
+    // a note on an otherwise-unchanged tree still deserves recording
+    if (a.note && !changed) {
       (stateGroups[a.state] ??= { positions: [], notes: [] });
       if (!stateGroups[a.state].positions.includes(p)) stateGroups[a.state].positions.push(p);
       stateGroups[a.state].notes.push(`Árbol ${p}: ${a.note}`);
@@ -1028,6 +1064,9 @@ async function finishCensusRow(row) {
   }
   for (const [status, g] of Object.entries(healthGroups)) {
     inserts.push({ date: today, type: 'Health', status, positions: g.positions.sort((a, b) => a - b), text: g.notes.join('; ') });
+  }
+  for (const [status, g] of Object.entries(vigorGroups)) {
+    inserts.push({ date: today, type: 'Vigor', status, positions: g.positions.sort((a, b) => a - b), text: g.notes.join('; ') });
   }
   inserts.push({
     date: today, type: 'Census',
