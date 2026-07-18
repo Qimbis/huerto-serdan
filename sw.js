@@ -1,4 +1,4 @@
-const CACHE_NAME = 'orchard-shell-v2';
+const CACHE_NAME = 'orchard-shell-v3';
 const SHELL_FILES = ['./', './index.html', './app.js', './config.js', './icon.svg', './manifest.webmanifest'];
 
 self.addEventListener('install', event => {

@@ -143,6 +143,22 @@ let currentUser = null;
 let lastFetchAt = 0;
 const REFETCH_THROTTLE_MS = 30_000;
 
+// Non-row plantings (Fase 6: sondeo de duraznos, piñones, capulín, etc.)
+let OTHER_PLANTINGS = [];
+let otherPlantingsAvailable = true; // false until the owner runs the migration
+
+// A background refetch (maybeRefetch, on visibilitychange/focus) replaces
+// ORCHARD_DATA.rows/OTHER_PLANTINGS with brand-new objects. Any modal open
+// at that moment still closes over the OLD object — writing to these
+// helpers' live-array lookups (instead of the closed-over reference)
+// before mutating local state is what keeps a save-then-reopen honest.
+function currentRow(id) {
+  return ORCHARD_DATA.rows.find(r => r.id === id);
+}
+function currentPlanting(id) {
+  return OTHER_PLANTINGS.find(p => p.id === id);
+}
+
 function rowsBySection(sectionId) {
   return ORCHARD_DATA.rows.filter(r => r.sectionId === sectionId);
 }
@@ -470,7 +486,7 @@ function openRowDetail(rowId) {
   `;
   lucide.createIcons();
   $('#row-detail-backdrop').classList.remove('hidden');
-  $('#close-row-detail').addEventListener('click', closeRowDetail);
+  $('#close-row-detail').addEventListener('click', closeDetailModal);
   wireTreeGrid(row);
 
   $$('[data-field]', $('#row-detail-panel')).forEach(el => {
@@ -501,12 +517,12 @@ function openRowDetail(rowId) {
           patch.variety_confirmed_at = today2;
         }
 
-        updateRowRemote(row, patch, () => {
-          row.variety = newVariety;
+        updateRowRemote(row, patch, freshRow => {
+          freshRow.variety = newVariety;
           if (newVariety === 'unconfirmed') {
-            delete row.varietyConfirmedAt;
+            delete freshRow.varietyConfirmedAt;
           } else if (wasUnconfirmed) {
-            row.varietyConfirmedAt = today2;
+            freshRow.varietyConfirmedAt = today2;
           }
         }, () => { el.value = oldVariety; }).then(ok => {
           if (ok && wasUnconfirmed && newVariety !== 'unconfirmed') {
@@ -520,8 +536,8 @@ function openRowDetail(rowId) {
       const value = (field === 'age' || field === 'treeCount') ? Math.max(0, Number(el.value) || 0) : el.value;
       const oldValue = row[field];
 
-      updateRowRemote(row, { [dbField]: value }, () => {
-        row[field] = value;
+      updateRowRemote(row, { [dbField]: value }, freshRow => {
+        freshRow[field] = value;
       }, () => { el.value = oldValue; });
     });
   });
@@ -557,7 +573,7 @@ async function insertRowEventCore(row, entry) {
     console.error('Row event insert failed', error);
     return false;
   }
-  row.log.push({
+  (currentRow(row.id) || row).log.push({
     date: data.event_date, type: data.type, text: data.note,
     positions: data.tree_positions || undefined,
     status: data.status || undefined,
@@ -573,7 +589,7 @@ async function updateRowRemote(row, patch, onSuccess, onFailure) {
     renderMap(); renderInventory(); openRowDetail(row.id);
     return false;
   }
-  onSuccess();
+  onSuccess(currentRow(row.id) || row);
   markSaved();
   renderMap();
   renderInventory();
@@ -592,7 +608,9 @@ async function insertRowEventRemote(row, entry) {
   openRowDetail(row.id);
 }
 
-function closeRowDetail() {
+// Shared modal backdrop — used by both the row detail panel and the
+// other-plantings detail panel (only one is ever open at a time).
+function closeDetailModal() {
   $('#row-detail-backdrop').classList.add('hidden');
 }
 
@@ -1422,6 +1440,245 @@ function renderInventory() {
   `;
 }
 
+// ---------- Otros árboles tab (Fase 6: sondeo de no-hileras) ----------
+async function updatePlantingCore(planting, patch) {
+  const { error } = await supabase.from('other_plantings').update(patch).eq('id', planting.id);
+  if (error) {
+    console.error('Planting update failed', error);
+    return false;
+  }
+  return true;
+}
+
+async function insertPlantingEventCore(planting, entry) {
+  const payload = {
+    planting_id: planting.id,
+    event_date: entry.date,
+    count: entry.count,
+    note: entry.note || '',
+    created_by: currentUser?.id ?? null,
+  };
+  const { data, error } = await supabase.from('planting_events').insert(payload).select().single();
+  if (error) {
+    console.error('Planting event insert failed', error);
+    return false;
+  }
+  (currentPlanting(planting.id) || planting).log.push({ date: data.event_date, count: data.count, note: data.note });
+  return true;
+}
+
+// Records a fresh field count: appends to the dated history (source of
+// truth for tracking survivors over time, e.g. duraznos after the frost)
+// and updates the cached snapshot fields other_plantings carries for
+// quick display. Two separate writes, not one transaction — if the first
+// succeeds and the second fails, the history is correct but the snapshot
+// (count/count_confirmed/last_count_at) lags until the next successful
+// save; flagged for review rather than papered over with a DB function.
+async function recordPlantingCount(planting, newCount, note) {
+  const today = new Date().toISOString().slice(0, 10);
+  const eventOk = await insertPlantingEventCore(planting, { date: today, count: newCount, note });
+  if (!eventOk) {
+    showSaveError('No se pudo guardar el conteo — revisa tu conexión e intenta de nuevo.');
+    return false;
+  }
+  const snapshotOk = await updatePlantingCore(planting, { count: newCount, count_confirmed: true, last_count_at: today });
+  if (snapshotOk) {
+    const freshPlanting = currentPlanting(planting.id) || planting;
+    freshPlanting.count = newCount;
+    freshPlanting.countConfirmed = true;
+    freshPlanting.lastCountAt = today;
+    markSaved();
+  } else {
+    showSaveError('El conteo se guardó en el historial, pero no se pudo actualizar el resumen — revisa tu conexión.');
+  }
+  renderOtros();
+  return true;
+}
+
+function openPlantingDetail(id) {
+  const planting = OTHER_PLANTINGS.find(p => p.id === id);
+  if (!planting) return;
+  let tallyValue = planting.count ?? 0;
+
+  const historyRows = planting.log.length === 0
+    ? `<p class="text-xs text-slate-500 italic">Sin conteos todavía</p>`
+    : [...planting.log].reverse().map(e => `
+        <div class="text-xs border border-slate-700 rounded-md px-2 py-1.5">
+          <span class="text-slate-500">${esc(e.date)}</span>
+          <span class="text-slate-300 font-medium ml-1">${e.count === null ? 'Sin conteo' : `${e.count} árboles`}</span>
+          ${e.note ? `<p class="text-slate-400 mt-0.5">${esc(e.note)}</p>` : ''}
+        </div>
+      `).join('');
+
+  $('#row-detail-panel').innerHTML = `
+    <div class="p-5 space-y-4">
+      <div class="flex items-start justify-between">
+        <div>
+          <h3 class="text-xl font-semibold">${esc(planting.name)}</h3>
+          <p class="text-sm text-slate-400">${planting.lastCountAt ? `Último conteo: ${esc(planting.lastCountAt)}` : 'Nunca contado'}</p>
+        </div>
+        <button id="close-planting-detail" class="tap-target p-2 -m-2 text-slate-400 hover:text-white">
+          <i data-lucide="x" class="w-5 h-5"></i>
+        </button>
+      </div>
+
+      <label class="text-xs text-slate-400 block">
+        Zona
+        <input data-planting-field="zone" type="text" value="${esc(planting.zone)}" placeholder="Ej. recinto, junto al bebedero"
+               class="tap-target mt-1 w-full rounded-md bg-slate-900 border border-slate-600 px-2 text-sm text-slate-100" />
+      </label>
+
+      <label class="text-xs text-slate-400 block">
+        Notas
+        <textarea data-planting-field="notes" rows="2" placeholder="Notas generales..."
+                  class="mt-1 w-full rounded-md bg-slate-900 border border-slate-600 px-2 py-1.5 text-sm text-slate-100">${esc(planting.notes || '')}</textarea>
+      </label>
+
+      <div class="rounded-lg border border-slate-600 bg-slate-900/70 p-3">
+        <h4 class="text-sm font-medium text-slate-300 mb-2">Contar ahora</h4>
+        <div class="flex items-center justify-center gap-6 py-2">
+          <button id="tally-minus" class="tap-target w-14 h-14 rounded-full bg-slate-700 hover:bg-slate-600 text-2xl font-bold text-white">−</button>
+          <div id="tally-value" class="text-4xl font-bold w-16 text-center">${tallyValue}</div>
+          <button id="tally-plus" class="tap-target w-14 h-14 rounded-full bg-emerald-700 hover:bg-emerald-600 text-2xl font-bold text-white">+</button>
+        </div>
+        <input id="tally-note" type="text" placeholder="Nota (opcional)"
+               class="tap-target w-full rounded-md bg-slate-900 border border-slate-600 px-2 text-sm text-slate-100" />
+        <button id="tally-save" class="tap-target mt-2 w-full rounded-md bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-medium">Guardar conteo</button>
+      </div>
+
+      <div>
+        <h4 class="text-sm font-medium text-slate-300 mb-2">Historial de conteos</h4>
+        <div class="space-y-1.5 max-h-40 overflow-y-auto">${historyRows}</div>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+  $('#row-detail-backdrop').classList.remove('hidden');
+  $('#close-planting-detail').addEventListener('click', closeDetailModal);
+
+  $$('[data-planting-field]', $('#row-detail-panel')).forEach(el => {
+    el.addEventListener('change', async () => {
+      const field = el.dataset.plantingField;
+      const oldValue = planting[field];
+      const value = el.value;
+      const ok = await updatePlantingCore(planting, { [field]: value });
+      if (!ok) {
+        showSaveError('No se pudo guardar el cambio — revisa tu conexión e intenta de nuevo.');
+        el.value = oldValue;
+        return;
+      }
+      (currentPlanting(planting.id) || planting)[field] = value;
+      markSaved();
+      renderOtros();
+    });
+  });
+
+  $('#tally-minus').addEventListener('click', () => {
+    tallyValue = Math.max(0, tallyValue - 1);
+    $('#tally-value').textContent = tallyValue;
+  });
+  $('#tally-plus').addEventListener('click', () => {
+    tallyValue += 1;
+    $('#tally-value').textContent = tallyValue;
+  });
+  $('#tally-save').addEventListener('click', () => {
+    recordPlantingCount(planting, tallyValue, $('#tally-note').value.trim()).then(ok => {
+      if (ok) openPlantingDetail(planting.id);
+    });
+  });
+}
+
+function renderOtros() {
+  const panel = $('#tab-otros');
+  if (!panel) return;
+
+  if (!otherPlantingsAvailable) {
+    panel.innerHTML = `
+      <div class="rounded-lg border border-amber-700 bg-amber-900/30 p-4 text-sm text-amber-200">
+        <p class="font-semibold mb-1">Falta activar esta sección</p>
+        <p>Esta función necesita una tabla nueva en la base de datos. Ejecuta la migración
+           <code class="text-amber-100">migrations/2026-07-18-other-plantings.sql</code>
+           en el editor SQL de Supabase y recarga la página.</p>
+      </div>
+    `;
+    return;
+  }
+
+  const cards = OTHER_PLANTINGS.map(p => {
+    const countLabel = p.count === null ? 'Por confirmar' : `${p.count}`;
+    const confirmedBadge = p.count === null
+      ? `<span class="text-[11px] px-2 py-0.5 rounded-full border border-amber-600 text-amber-400">Por confirmar</span>`
+      : p.countConfirmed
+        ? `<span class="text-[11px] px-2 py-0.5 rounded-full border border-emerald-700 text-emerald-400">Confirmado</span>`
+        : `<span class="text-[11px] px-2 py-0.5 rounded-full border border-slate-600 text-slate-400">Estimado</span>`;
+    const dateLabel = p.lastCountAt ? `Contado ${esc(p.lastCountAt)}` : 'Nunca contado';
+    return `
+      <button data-planting-id="${p.id}" class="planting-card w-full text-left tap-target rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700/70 active:bg-slate-700 transition p-3 flex items-center justify-between gap-2">
+        <div class="min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="font-semibold">${esc(p.name)}</span>
+            ${confirmedBadge}
+          </div>
+          <p class="text-xs text-slate-400 truncate">${p.zone ? esc(p.zone) : 'Sin zona'} · ${dateLabel}</p>
+        </div>
+        <span class="text-xl font-semibold shrink-0">${countLabel}</span>
+      </button>
+    `;
+  }).join('');
+
+  const emptyState = OTHER_PLANTINGS.length === 0
+    ? `<p class="text-sm text-slate-500 italic px-1">No hay plantas registradas todavía.</p>`
+    : '';
+
+  panel.innerHTML = `
+    <div class="px-1">
+      <h2 class="font-semibold">Otros árboles</h2>
+      <p class="text-xs text-slate-400 mt-0.5">Todo lo que no forma parte de las 37 hileras de manzano: duraznos, piñones, capulín, kiwi, arándanos, fresas y demás.</p>
+    </div>
+    <div class="space-y-2">${cards}</div>
+    ${emptyState}
+    <button id="planting-add" class="tap-target w-full rounded-lg border border-dashed border-slate-600 text-slate-400 hover:text-white hover:border-slate-400 text-sm py-2.5 flex items-center justify-center gap-1.5">
+      <i data-lucide="plus" class="w-4 h-4"></i> Agregar planta (si falta alguna)
+    </button>
+    <div id="planting-add-form" class="hidden rounded-lg border border-slate-700 bg-slate-800 p-3 space-y-2">
+      <input id="new-planting-name" type="text" placeholder="Nombre / especie (obligatorio)"
+             class="tap-target w-full rounded-md bg-slate-900 border border-slate-600 px-2 text-sm text-slate-100" />
+      <input id="new-planting-zone" type="text" placeholder="Zona (opcional)"
+             class="tap-target w-full rounded-md bg-slate-900 border border-slate-600 px-2 text-sm text-slate-100" />
+      <div class="flex gap-2">
+        <button id="save-new-planting" class="tap-target flex-1 rounded-md bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-medium">Guardar</button>
+        <button id="cancel-new-planting" class="tap-target flex-1 rounded-md bg-slate-700 hover:bg-slate-600 text-white text-sm font-medium">Cancelar</button>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+
+  $$('.planting-card', panel).forEach(btn =>
+    btn.addEventListener('click', () => openPlantingDetail(Number(btn.dataset.plantingId))));
+
+  $('#planting-add').addEventListener('click', () => $('#planting-add-form').classList.toggle('hidden'));
+  $('#cancel-new-planting').addEventListener('click', () => $('#planting-add-form').classList.add('hidden'));
+  $('#save-new-planting').addEventListener('click', async () => {
+    const name = $('#new-planting-name').value.trim();
+    if (!name) { $('#new-planting-name').focus(); return; }
+    const zone = $('#new-planting-zone').value.trim();
+    const { data, error } = await supabase.from('other_plantings').insert({ name, zone }).select().single();
+    if (error) {
+      console.error('Planting insert failed', error);
+      showSaveError('No se pudo guardar la planta — revisa tu conexión e intenta de nuevo (¿nombre repetido?).');
+      return;
+    }
+    OTHER_PLANTINGS.push({
+      id: data.id, name: data.name, zone: data.zone, count: data.count,
+      countConfirmed: data.count_confirmed, lastCountAt: data.last_count_at,
+      notes: data.notes || '', log: [],
+    });
+    OTHER_PLANTINGS.sort((a, b) => a.id - b.id);
+    markSaved();
+    renderOtros();
+  });
+}
+
 // ============================================================
 // Data assembly (Supabase rows -> in-memory shape the UI expects)
 // ============================================================
@@ -1482,6 +1739,47 @@ async function fetchAllData() {
   ORCHARD_DATA.tasks = tasksRes.data.map(taskFromRow);
 }
 
+// PostgREST reports a missing table differently depending on whether it
+// hit Postgres directly (42P01) or its own schema cache (PGRST205) — the
+// other_plantings/planting_events tables don't exist until the owner runs
+// their migration, and that must degrade gracefully, not blank the app.
+function isMissingTableError(err) {
+  const code = err?.code || '';
+  const msg = err?.message || '';
+  return code === '42P01' || code === 'PGRST205' || /schema cache/i.test(msg);
+}
+
+async function fetchOtherPlantings() {
+  const [plantingsRes, eventsRes] = await Promise.all([
+    supabase.from('other_plantings').select('*'),
+    supabase.from('planting_events').select('*')
+      .order('event_date', { ascending: true }).order('created_at', { ascending: true }),
+  ]);
+
+  const firstError = plantingsRes.error || eventsRes.error;
+  if (firstError) {
+    if (isMissingTableError(firstError)) {
+      otherPlantingsAvailable = false;
+      OTHER_PLANTINGS = [];
+      return;
+    }
+    throw firstError;
+  }
+
+  otherPlantingsAvailable = true;
+  const eventsByPlanting = {};
+  for (const e of eventsRes.data) {
+    (eventsByPlanting[e.planting_id] ??= []).push({ date: e.event_date, count: e.count, note: e.note });
+  }
+  OTHER_PLANTINGS = plantingsRes.data
+    .map(p => ({
+      id: p.id, name: p.name, zone: p.zone, count: p.count,
+      countConfirmed: p.count_confirmed, lastCountAt: p.last_count_at,
+      notes: p.notes || '', log: eventsByPlanting[p.id] || [],
+    }))
+    .sort((a, b) => a.id - b.id);
+}
+
 function markSaved() {
   const indicator = $('#save-indicator');
   if (indicator) indicator.textContent = `Guardado · ${new Date().toLocaleTimeString('es-MX')}`;
@@ -1490,20 +1788,32 @@ function markSaved() {
 async function refreshData({ silent = false } = {}) {
   try {
     await fetchAllData();
-    renderMap();
-    renderCensus();
-    renderTasks();
-    renderInventory();
-    if (!silent) markSaved();
   } catch (e) {
     console.error('Refresh failed', e);
     if (!silent) showSaveError('No se pudieron actualizar los datos — revisa tu conexión.');
+    return;
   }
+  try {
+    await fetchOtherPlantings();
+  } catch (e) {
+    console.error('Other plantings refresh failed', e);
+    if (!silent) showSaveError('No se pudo actualizar la sección "Otros" — revisa tu conexión.');
+  }
+  renderMap();
+  renderCensus();
+  renderTasks();
+  renderInventory();
+  renderOtros();
+  if (!silent) markSaved();
 }
 
 // ---------- Export / v1 import ----------
 function exportData() {
-  const blob = new Blob([JSON.stringify(ORCHARD_DATA, null, 2)], { type: 'application/json' });
+  // OTHER_PLANTINGS lives as its own top-level variable (same convention as
+  // VARIETIES/SECTIONS), not nested inside ORCHARD_DATA — merge it in here
+  // so the "backup de todos los cambios" tooltip stays honest.
+  const data = { ...ORCHARD_DATA, otherPlantings: OTHER_PLANTINGS };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -1590,7 +1900,7 @@ function setActiveTab(tab) {
 function wireAppEvents() {
   $$('.tab-btn').forEach(btn => btn.addEventListener('click', () => setActiveTab(btn.dataset.tab)));
   $('#row-detail-backdrop').addEventListener('click', e => {
-    if (e.target.id === 'row-detail-backdrop') closeRowDetail();
+    if (e.target.id === 'row-detail-backdrop') closeDetailModal();
   });
   $('#export-btn').addEventListener('click', exportData);
   $('#import-input').addEventListener('change', e => {

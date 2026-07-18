@@ -50,18 +50,21 @@
 
     <section id="climate-panel" class="rounded-xl border border-slate-700 bg-slate-800 p-4"></section>
 
-    <nav class="flex gap-1 rounded-lg bg-slate-800 border border-slate-700 p-1 text-sm font-medium">
-      <button data-tab="map" class="tab-btn flex-1 tap-target rounded-md px-2 py-2 flex items-center justify-center gap-1.5">
-        <i data-lucide="layout-grid" class="w-4 h-4"></i> Hileras
+    <nav class="flex gap-1 rounded-lg bg-slate-800 border border-slate-700 p-1 text-[11px] sm:text-sm font-medium">
+      <button data-tab="map" class="tab-btn flex-1 tap-target rounded-md px-1 sm:px-2 py-2 flex items-center justify-center gap-1 sm:gap-1.5">
+        <i data-lucide="layout-grid" class="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0"></i> Hileras
       </button>
-      <button data-tab="census" class="tab-btn flex-1 tap-target rounded-md px-2 py-2 flex items-center justify-center gap-1.5">
-        <i data-lucide="list-checks" class="w-4 h-4"></i> Censo
+      <button data-tab="census" class="tab-btn flex-1 tap-target rounded-md px-1 sm:px-2 py-2 flex items-center justify-center gap-1 sm:gap-1.5">
+        <i data-lucide="list-checks" class="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0"></i> Censo
       </button>
-      <button data-tab="tasks" class="tab-btn flex-1 tap-target rounded-md px-2 py-2 flex items-center justify-center gap-1.5">
-        <i data-lucide="clipboard-list" class="w-4 h-4"></i> Tareas
+      <button data-tab="tasks" class="tab-btn flex-1 tap-target rounded-md px-1 sm:px-2 py-2 flex items-center justify-center gap-1 sm:gap-1.5">
+        <i data-lucide="clipboard-list" class="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0"></i> Tareas
       </button>
-      <button data-tab="inventory" class="tab-btn flex-1 tap-target rounded-md px-2 py-2 flex items-center justify-center gap-1.5">
-        <i data-lucide="sprout" class="w-4 h-4"></i> Inventario
+      <button data-tab="inventory" class="tab-btn flex-1 tap-target rounded-md px-1 sm:px-2 py-2 flex items-center justify-center gap-1 sm:gap-1.5">
+        <i data-lucide="sprout" class="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0"></i> Inventario
+      </button>
+      <button data-tab="otros" class="tab-btn flex-1 tap-target rounded-md px-1 sm:px-2 py-2 flex items-center justify-center gap-1 sm:gap-1.5">
+        <i data-lucide="leaf" class="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0"></i> Otros
       </button>
     </nav>
 
@@ -69,6 +72,7 @@
     <section id="tab-census" class="tab-panel hidden"></section>
     <section id="tab-tasks" class="tab-panel hidden"></section>
     <section id="tab-inventory" class="tab-panel hidden"></section>
+    <section id="tab-otros" class="tab-panel hidden space-y-3"></section>
 
   </main>
 
